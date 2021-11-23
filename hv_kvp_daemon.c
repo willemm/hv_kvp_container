@@ -28,7 +28,8 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/poll.h>
+// #include <sys/poll.h>
+#include <poll.h>
 #include <sys/utsname.h>
 #include <linux/types.h>
 #include <stdio.h>
@@ -49,23 +50,9 @@
 #include <dirent.h>
 #include <net/if.h>
 
-// #include "config.h"
-/* Another hacky way of getting it to compile on any system that DOES not have any hyperv.h headers or them included in the kernel package */
+#include <curl/curl.h>
 
-// #ifdef HAVE_LINUX_HYPERV_H
 #include <linux/hyperv.h>
-// #else
-/* let's use our own headers if we can't find the friggin header */
-// #include "hyperv.h"
-// #endif
-
-/*
- Hacky way of getting hv_kvp_daemon.c to compile, but hey it works
-*/
-#ifndef CN_KVP_IDX
-#define CN_KVP_IDX 0x9
-#define CN_KVP_VAL 0x1
-#endif
 
 /*
  * KVP protocol: The user mode component first registers with the
@@ -384,6 +371,121 @@ static int kvp_key_delete(int pool, const char *key, int key_size)
 		return 0;
 	}
 	return 1;
+}
+
+static char *kubectl_token = NULL;
+
+static void read_kubectl_token()
+{
+	FILE *fp = fopen("/var/run/secrets/kubernetes.io/serviceaccount/token", "r");
+	if (!fp) {
+		syslog(LOG_ERR, "Failed to open kubectl token: %d %s", errno, strerror(errno));
+		return;
+	}
+	free(kubectl_token);
+	size_t n;
+	if (getline(&kubectl_token, &n, fp) < 0) {
+		syslog(LOG_ERR, "Failed to read kubectl token: %d %s", errno, strerror(errno));
+	}
+	fclose(fp);
+}
+
+static CURL *curl_kubectl()
+{
+	if (!kubectl_token) {
+		return NULL;
+	}
+
+	CURL * curl = curl_easy_init();
+
+	curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BEARER);
+	curl_easy_setopt(curl, CURLOPT_XOAUTH2_BEARER, kubectl_token);
+	curl_easy_setopt(curl, CURLOPT_CAINFO, "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt");
+
+	curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+
+	struct curl_slist *headers = NULL;
+	headers = curl_slist_append(headers, "Accept: application/yaml");
+	headers = curl_slist_append(headers, "Content-Type: application/json-patch+json; charset=utf-8");
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+	return curl;
+}
+
+/* HV key, kubernetes api path, prefix */
+static char * key_to_label_map[] = {
+	"VirtualMachineId", "/spec/providerID", "scvmm://",
+	"PhysicalHostNameFullyQualified", "/metadata/labels/topology.kubernetes.io~1physicalhost", "",
+	"VirtualMachineName", "/metadata/annotations/scvmmmachine.cluster.x-k8s.io~1vmname", "",
+	NULL
+};
+
+static int kvp_do_special()
+{
+	int pool = 3;
+	char curl_error[CURL_ERROR_SIZE];
+	CURL *curl = NULL;
+
+	kvp_update_mem_state(pool);
+
+	int num_records = kvp_file_info[pool].num_records;
+	struct kvp_record *record = kvp_file_info[pool].records;
+
+	for (int i = 0; i < num_records; i++) {
+		for (int idx = 0; key_to_label_map[idx]; idx += 3) {
+			if (!strcmp(key_to_label_map[idx], record[i].key)) {
+				syslog(LOG_INFO, "Send key value: key %s, value %s", record[i].key, record[i].value);
+				if (!curl) {
+					curl = curl_kubectl();
+					if (!curl) {
+						syslog(LOG_ERR, "Curl failed to initialize");
+						return 1;
+					}
+					curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_error);
+				}
+				char url[256];
+				/*
+				int n = snprintf(url, sizeof(url), "https://%s:%s/api/v1/nodes/%s"
+						, getenv("KUBERNETES_SERVICE_HOST")
+						, getenv("KUBERNETES_SERVICE_PORT")
+						, getenv("KUBERNETES_NODE_NAME")
+						);
+						*/
+				int n = snprintf(url, sizeof(url), "https://kubernetes.default.svc/api/v1/nodes/%s"
+						, getenv("KUBERNETES_NODE_NAME")
+						);
+				if (n > sizeof(url)) {
+					syslog(LOG_ERR, "Failed to create kubectl uri: too large");
+					curl_easy_cleanup(curl);
+					return 1;
+				}
+				curl_easy_setopt(curl, CURLOPT_URL, url);
+				char body[1024];
+				n = snprintf(body, sizeof(body), "[{\"op\":\"add\",\"path\":\"%s\",\"value\":\"%s%s\"}]"
+						, key_to_label_map[idx+1]
+						, key_to_label_map[idx+2]
+						, record[i].value
+						);
+				if (n > sizeof(body)) {
+					syslog(LOG_ERR, "Failed to create kubectl patch body: too large");
+					curl_easy_cleanup(curl);
+					return 1;
+				}
+				curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+				curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
+
+				syslog(LOG_INFO, "Sending to %s, body:\n%s\n", url, body);
+				CURLcode res = curl_easy_perform(curl);
+				if (res != 0) {
+					syslog(LOG_ERR, "Curl call returned %d (%s)", res, curl_error);
+					curl_easy_cleanup(curl);
+					return 1;
+				}
+			}
+		}
+	}
+	curl_easy_cleanup(curl);
+	return 0;
 }
 
 static int kvp_key_add_or_modify(int pool, const char *key, int key_size, const char *value,
@@ -739,7 +841,7 @@ static char *kvp_mac_to_if_name(char *mac)
 	if (dir == NULL)
 		return NULL;
 
-	snprintf(dev_id, sizeof(dev_id), kvp_net_dir);
+	snprintf(dev_id, sizeof(dev_id), "%s", kvp_net_dir);
 	q = dev_id + strlen(kvp_net_dir);
 
 	while ((entry = readdir(dir)) != NULL) {
@@ -1540,13 +1642,24 @@ int main(void)
 
 	pfd.fd = fd;
 
+	read_kubectl_token();
+
+	int do_special = 1;
 	while (1) {
 		struct sockaddr *addr_p = (struct sockaddr *) &addr;
 		socklen_t addr_l = sizeof(addr);
 		pfd.events = POLLIN;
 		pfd.revents = 0;
 
-		if (poll(&pfd, 1, -1) < 0) {
+		int timeout = -1;
+		if (do_special) {
+			if (!kvp_do_special()) {
+				do_special = 0;
+			} else {
+				timeout = 5000;
+			}
+		}
+		if (poll(&pfd, 1, timeout) < 0) {
 			syslog(LOG_ERR, "poll failed; error: %d %s", errno, strerror(errno));
 			if (errno == EINVAL) {
 				close(fd);
@@ -1658,7 +1771,10 @@ int main(void)
 					hv_msg->body.kvp_set.data.key_size,
 					hv_msg->body.kvp_set.data.value,
 					hv_msg->body.kvp_set.data.value_size))
-					hv_msg->error = HV_S_CONT;
+				hv_msg->error = HV_S_CONT;
+			if (pool == 3) {
+				do_special = 1;
+			}
 			break;
 
 		case KVP_OP_GET:
