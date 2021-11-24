@@ -431,8 +431,8 @@ static int kvp_do_special()
 	int num_records = kvp_file_info[pool].num_records;
 	struct kvp_record *record = kvp_file_info[pool].records;
 
-	for (int i = 0; i < num_records; i++) {
-		for (int idx = 0; key_to_label_map[idx]; idx += 3) {
+	for (int idx = 0; key_to_label_map[idx]; idx += 3) {
+		for (int i = 0; i < num_records; i++) {
 			if (!strcmp(key_to_label_map[idx], record[i].key)) {
 				syslog(LOG_INFO, "Send key value: key %s, value %s", record[i].key, record[i].value);
 				if (!curl) {
@@ -1772,6 +1772,13 @@ int main(void)
 					hv_msg->body.kvp_set.data.value,
 					hv_msg->body.kvp_set.data.value_size))
 				hv_msg->error = HV_S_CONT;
+			syslog(LOG_INFO, "Received kvp on pool %d: %.*s = <%.*s>"
+					, pool
+					, hv_msg->body.kvp_set.data.key_size
+					, hv_msg->body.kvp_set.data.key
+					, hv_msg->body.kvp_set.data.value_size
+					, hv_msg->body.kvp_set.data.value
+					);
 			if (pool == 3) {
 				do_special = 1;
 			}
