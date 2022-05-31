@@ -414,9 +414,10 @@ static CURL *curl_kubectl()
 
 /* HV key, kubernetes api path, prefix */
 static char * key_to_label_map[] = {
-	"VirtualMachineId", "/spec/providerID", "scvmm://",
-	"PhysicalHostNameFullyQualified", "/metadata/labels/topology.kubernetes.io~1physicalhost", "",
-	"VirtualMachineName", "/metadata/annotations/scvmmmachine.cluster.x-k8s.io~1vmname", "",
+	"VirtualMachineId", "/spec/providerID", "scvmm://", NULL,
+	"VirtualMachineName", "/metadata/annotations/scvmmmachine.cluster.x-k8s.io~1vmname", "", NULL,
+	"PhysicalHostNameFullyQualified", "/metadata/labels/topology.kubernetes.io~1physicalhost", "", NULL,
+	"PhysicalHostNameFullyQualified", "/metadata/labels/topology.kubernetes.io~1zone", "", "AZaz",
 	NULL
 };
 
@@ -431,7 +432,7 @@ static int kvp_do_special()
 	int num_records = kvp_file_info[pool].num_records;
 	struct kvp_record *record = kvp_file_info[pool].records;
 
-	for (int idx = 0; key_to_label_map[idx]; idx += 3) {
+	for (int idx = 0; key_to_label_map[idx]; idx += 4) {
 		for (int i = 0; i < num_records; i++) {
 			if (!strcmp(key_to_label_map[idx], record[i].key)) {
 				syslog(LOG_INFO, "Send key value: key %s, value %s", record[i].key, record[i].value);
@@ -460,10 +461,31 @@ static int kvp_do_special()
 					return 1;
 				}
 				curl_easy_setopt(curl, CURLOPT_URL, url);
+				int cutoff = 0;
+				const char *value = record[i].value;
+				if (key_to_label_map[idx+3]) {
+					// Only use beginning of value, matching letter set
+					const char *pattern = key_to_label_map[idx+3];
+					int match = 1;
+					while (match && value[cutoff]) {
+						cutoff++;
+                                                match = 0;
+						for (int mm = 0; key_to_label_map[idx+3][mm]; mm += 2) {
+							if (record[i].value[cutoff] >= pattern[mm]
+							 && record[i].value[cutoff] <= pattern[mm+1]) {
+								match = 1;
+								break;
+							}
+						}
+					}
+				} else {
+					cutoff = strlen(record[i].value);
+				}
 				char body[1024];
-				n = snprintf(body, sizeof(body), "[{\"op\":\"add\",\"path\":\"%s\",\"value\":\"%s%s\"}]"
+				n = snprintf(body, sizeof(body), "[{\"op\":\"add\",\"path\":\"%s\",\"value\":\"%s%.*s\"}]"
 						, key_to_label_map[idx+1]
 						, key_to_label_map[idx+2]
+						, cutoff
 						, record[i].value
 						);
 				if (n > sizeof(body)) {
@@ -1672,7 +1694,7 @@ int main(void)
 		len = recvfrom(fd, kvp_recv_buffer, kvp_recv_buffer_len, 0,
 				addr_p, &addr_l);
 
-                // syslog(LOG_INFO, "Received packet of length %d", len);
+		// syslog(LOG_INFO, "Received packet of length %d", len);
 		if (len < 0) {
 			syslog(LOG_ERR, "recvfrom failed; pid:%u error:%d %s",
 					addr.nl_pid, errno, strerror(errno));
